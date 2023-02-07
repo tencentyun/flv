@@ -1,0 +1,1195 @@
+From 9f9e5f9ee51a29789c61b4d4106339f49578dc3a Mon Sep 17 00:00:00 2001
+From: Zhao Zhili <zhilizhao@tencent.com>
+Date: Thu, 16 Feb 2023 23:00:30 +0800
+Subject: [PATCH 3/3] lavf/flv: add extensions for vvc
+
+---
+ libavformat/Makefile |   2 +-
+ libavformat/flv.h    |   1 +
+ libavformat/flvdec.c |  16 +-
+ libavformat/flvenc.c |  23 +-
+ libavformat/vvc.c    | 902 +++++++++++++++++++++++++++++++++++++++++++
+ libavformat/vvc.h    |  99 +++++
+ 6 files changed, 1035 insertions(+), 8 deletions(-)
+ create mode 100644 libavformat/vvc.c
+ create mode 100644 libavformat/vvc.h
+
+diff --git a/libavformat/Makefile b/libavformat/Makefile
+index 0f340f74a0..a1b3084403 100644
+--- a/libavformat/Makefile
++++ b/libavformat/Makefile
+@@ -199,7 +199,7 @@ OBJS-$(CONFIG_FLAC_MUXER)                += flacenc.o flacenc_header.o \
+ OBJS-$(CONFIG_FLIC_DEMUXER)              += flic.o
+ OBJS-$(CONFIG_FLV_DEMUXER)               += flvdec.o
+ OBJS-$(CONFIG_LIVE_FLV_DEMUXER)          += flvdec.o
+-OBJS-$(CONFIG_FLV_MUXER)                 += flvenc.o avc.o
++OBJS-$(CONFIG_FLV_MUXER)                 += flvenc.o avc.o av1.o hevc.o vvc.o
+ OBJS-$(CONFIG_FOURXM_DEMUXER)            += 4xm.o
+ OBJS-$(CONFIG_FRAMECRC_MUXER)            += framecrcenc.o framehash.o
+ OBJS-$(CONFIG_FRAMEHASH_MUXER)           += hashenc.o framehash.o
+diff --git a/libavformat/flv.h b/libavformat/flv.h
+index 1f4462d41e..9d14754391 100644
+--- a/libavformat/flv.h
++++ b/libavformat/flv.h
+@@ -112,6 +112,7 @@ enum {
+     FLV_CODECID_MPEG4   = 9,
+     FLV_CODECID_HEVC    = 12,   // 0xC
+     FLV_CODECID_AV1     = 13,   // 0xD
++    FLV_CODECID_VVC     = 14,
+ };
+ 
+ enum {
+diff --git a/libavformat/flvdec.c b/libavformat/flvdec.c
+index cde9240f55..0e8664368e 100644
+--- a/libavformat/flvdec.c
++++ b/libavformat/flvdec.c
+@@ -325,6 +325,8 @@ static int flv_same_video_codec(AVCodecParameters *vpar, int flags)
+         return vpar->codec_id == AV_CODEC_ID_HEVC;
+     case FLV_CODECID_AV1:
+         return vpar->codec_id == AV_CODEC_ID_AV1;
++    case FLV_CODECID_VVC:
++        return vpar->codec_id == AV_CODEC_ID_VVC;
+     default:
+         return vpar->codec_tag == flv_codecid;
+     }
+@@ -384,6 +386,11 @@ static int flv_set_video_codec(AVFormatContext *s, AVStream *vstream,
+         vstream->need_parsing = AVSTREAM_PARSE_HEADERS;  // keep inline with movenc
+         ret = 3;     // not 4, reading packet type will consume one byte
+         break;
++    case FLV_CODECID_VVC:
++        par->codec_id = AV_CODEC_ID_VVC;
++        vstream->need_parsing = AVSTREAM_PARSE_HEADERS;
++        ret = 3;
++        break;
+     default:
+         avpriv_request_sample(s, "Video codec (%x)", flv_codecid);
+         par->codec_tag = flv_codecid;
+@@ -1260,7 +1267,8 @@ retry_duration:
+         st->codecpar->codec_id == AV_CODEC_ID_H264 ||
+         st->codecpar->codec_id == AV_CODEC_ID_MPEG4 ||
+         st->codecpar->codec_id == AV_CODEC_ID_AV1 ||
+-        st->codecpar->codec_id == AV_CODEC_ID_HEVC) {
++        st->codecpar->codec_id == AV_CODEC_ID_HEVC ||
++        st->codecpar->codec_id == AV_CODEC_ID_VVC) {
+         int type = avio_r8(s->pb);
+         size--;
+ 
+@@ -1272,7 +1280,8 @@ retry_duration:
+         if (st->codecpar->codec_id == AV_CODEC_ID_H264 ||
+             st->codecpar->codec_id == AV_CODEC_ID_MPEG4 ||
+             st->codecpar->codec_id == AV_CODEC_ID_AV1 ||
+-            st->codecpar->codec_id == AV_CODEC_ID_HEVC) {
++            st->codecpar->codec_id == AV_CODEC_ID_HEVC ||
++            st->codecpar->codec_id == AV_CODEC_ID_VVC) {
+             // sign extension
+             int32_t cts = (avio_rb24(s->pb) + 0xff800000) ^ 0xff800000;
+             pts = av_sat_add64(dts, cts);
+@@ -1290,7 +1299,8 @@ retry_duration:
+         if (type == 0 && (!st->codecpar->extradata || st->codecpar->codec_id == AV_CODEC_ID_AAC ||
+                            st->codecpar->codec_id == AV_CODEC_ID_H264 ||
+                            st->codecpar->codec_id == AV_CODEC_ID_AV1 ||
+-                           st->codecpar->codec_id == AV_CODEC_ID_HEVC)) {
++                           st->codecpar->codec_id == AV_CODEC_ID_HEVC ||
++                           st->codecpar->codec_id == AV_CODEC_ID_VVC)) {
+             AVDictionaryEntry *t;
+             if (st->codecpar->codec_id == AV_CODEC_ID_AV1) {
+                 /*
+diff --git a/libavformat/flvenc.c b/libavformat/flvenc.c
+index be953e60f9..1c89fd7b69 100644
+--- a/libavformat/flvenc.c
++++ b/libavformat/flvenc.c
+@@ -36,6 +36,7 @@
+ #include "libavutil/opt.h"
+ #include "libavcodec/put_bits.h"
+ #include "libavcodec/aacenctab.h"
++#include "vvc.h"
+ 
+ 
+ static const AVCodecTag flv_video_codec_ids[] = {
+@@ -50,6 +51,7 @@ static const AVCodecTag flv_video_codec_ids[] = {
+     { AV_CODEC_ID_H264,     FLV_CODECID_H264 },
+     { AV_CODEC_ID_HEVC,     FLV_CODECID_HEVC },
+     { AV_CODEC_ID_AV1,      FLV_CODECID_AV1 },
++    { AV_CODEC_ID_VVC,      FLV_CODECID_VVC },
+     { AV_CODEC_ID_NONE,     0 }
+ };
+ 
+@@ -498,7 +500,8 @@ static void flv_write_codec_header(AVFormatContext* s, AVCodecParameters* par, i
+         par->codec_id == AV_CODEC_ID_H264 ||
+         par->codec_id == AV_CODEC_ID_MPEG4 ||
+         par->codec_id == AV_CODEC_ID_AV1 ||
+-        par->codec_id == AV_CODEC_ID_HEVC) {
++        par->codec_id == AV_CODEC_ID_HEVC ||
++        par->codec_id == AV_CODEC_ID_VVC) {
+         int64_t pos;
+         avio_w8(pb,
+                 par->codec_type == AVMEDIA_TYPE_VIDEO ?
+@@ -555,6 +558,9 @@ static void flv_write_codec_header(AVFormatContext* s, AVCodecParameters* par, i
+             case AV_CODEC_ID_AV1:
+                 ff_isom_write_av1c(pb, par->extradata, par->extradata_size);
+                 break;
++            case AV_CODEC_ID_VVC:
++                ff_isom_write_vvcc(pb, par->extradata, par->extradata_size, 1);
++                break;
+             default:
+                 unsupported_codec(s, "Video", par->codec_id);
+             }
+@@ -919,7 +925,8 @@ static int flv_write_packet(AVFormatContext *s, AVPacket *pkt)
+         flags_size = 2;
+     else if (par->codec_id == AV_CODEC_ID_H264 || par->codec_id == AV_CODEC_ID_MPEG4 ||
+              par->codec_id == AV_CODEC_ID_AV1 ||
+-             par->codec_id == AV_CODEC_ID_HEVC)
++             par->codec_id == AV_CODEC_ID_HEVC ||
++             par->codec_id == AV_CODEC_ID_VVC)
+         flags_size = 5;
+     else
+         flags_size = 1;
+@@ -927,7 +934,8 @@ static int flv_write_packet(AVFormatContext *s, AVPacket *pkt)
+     if (par->codec_id == AV_CODEC_ID_AAC || par->codec_id == AV_CODEC_ID_H264
+             || par->codec_id == AV_CODEC_ID_MPEG4
+             || par->codec_id == AV_CODEC_ID_HEVC
+-            || par->codec_id == AV_CODEC_ID_AV1) {
++            || par->codec_id == AV_CODEC_ID_AV1
++            || par->codec_id == AV_CODEC_ID_VVC) {
+         buffer_size_t side_size;
+         uint8_t *side = av_packet_get_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA, &side_size);
+         if (side && side_size > 0 && (side_size != par->extradata_size || memcmp(side, par->extradata, side_size))) {
+@@ -1002,6 +1010,12 @@ static int flv_write_packet(AVFormatContext *s, AVPacket *pkt)
+     } else if (par->codec_id == AV_CODEC_ID_AV1) {
+         if ((ret = ff_av1_filter_obus_buf(pkt->data, &data, &size, &offset)) < 0)
+             return ret;
++    } else if (par->codec_id == AV_CODEC_ID_VVC) {
++        if (par->extradata_size > 0 && (par->extradata[0] >> 3) != 0x1F) {
++            ret = ff_vvc_annexb2mp4_buf(pkt->data, &data, &size, 0, NULL);
++            if (ret < 0)
++                return ret;
++        }
+     } else if (par->codec_id == AV_CODEC_ID_AAC && pkt->size > 2 &&
+                (AV_RB16(pkt->data) & 0xfff0) == 0xfff0) {
+         if (!s->streams[pkt->stream_index]->nb_frames) {
+@@ -1076,7 +1090,8 @@ static int flv_write_packet(AVFormatContext *s, AVPacket *pkt)
+             avio_w8(pb, 1); // AAC raw
+         else if (par->codec_id == AV_CODEC_ID_H264 || par->codec_id == AV_CODEC_ID_MPEG4 ||
+                  par->codec_id == AV_CODEC_ID_AV1 ||
+-                 par->codec_id == AV_CODEC_ID_HEVC) {
++                 par->codec_id == AV_CODEC_ID_HEVC ||
++                 par->codec_id == AV_CODEC_ID_VVC) {
+             avio_w8(pb, 1); // AVC/HEVC NALU / AV1 OBU
+             avio_wb24(pb, pkt->pts - pkt->dts);
+         }
+diff --git a/libavformat/vvc.c b/libavformat/vvc.c
+new file mode 100644
+index 0000000000..143008855b
+--- /dev/null
++++ b/libavformat/vvc.c
+@@ -0,0 +1,902 @@
++/*
++ * Copyright (c) 2021 Tencent
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "libavcodec/golomb.h"
++#include "libavcodec/vvc.h"
++#include "libavutil/imgutils.h"
++#include "libavutil/intreadwrite.h"
++#include "avc.h"
++#include "avio_internal.h"
++#include "vvc.h"
++
++enum {
++    MAX_NUM_BYTES_CONSTRAINT_INFO = 255,
++    MAX_NUM_SUB_PROFILES          = 255,
++};
++
++typedef struct VvcPTLRecord {
++    uint8_t num_bytes_constraint_info;
++    uint8_t general_profile_idc;
++    uint8_t general_tier_flag;
++    uint8_t general_level_idc;
++    uint8_t ptl_frame_only_constraint_flag;
++    uint8_t ptl_multilayer_enabled_flag;
++    uint8_t general_constraing_info[MAX_NUM_BYTES_CONSTRAINT_INFO];
++    uint8_t ptl_sublayer_level_present_flag[VVC_MAX_SUB_LAYERS];
++    uint8_t sublayer_level_idc[VVC_MAX_SUB_LAYERS];
++    uint8_t num_sub_profiles;
++    uint32_t general_sub_profile_idc[MAX_NUM_SUB_PROFILES];
++} VvcPTLRecord;
++
++typedef struct VVCCNALUnitArray {
++    uint8_t  array_completeness;
++    uint8_t  NAL_unit_type;
++    uint16_t numNalus;
++    uint16_t *nalUnitLength;
++    uint8_t  **nalUnit;
++} VVCCNALUnitArray;
++
++typedef struct VvcDecoderConfigurationRecord {
++    uint8_t lengthSizeMinusOne;
++    uint8_t ptl_present_flag;
++    uint16_t output_layer_set_idx;
++    uint8_t numTemporalLayers;
++    uint8_t constantFrameRate;
++    uint8_t chroma_format_idc;
++    uint8_t bit_depth_minus8;
++
++    uint16_t max_picture_width;
++    uint16_t max_picture_height;
++    uint16_t avgFrameRate;
++
++    uint8_t numOfArrays;
++    VvcPTLRecord track_ptl;
++    VVCCNALUnitArray *array;
++} VvcDecoderConfigurationRecord;
++
++static void vvcc_update_ptl(VvcDecoderConfigurationRecord *vvcc,
++                            VvcPTLRecord *ptl)
++{
++    if (vvcc->ptl_present_flag) {
++        // TODO: support multiple PTL
++        av_log(NULL, AV_LOG_WARNING, "multiple PTL not supported: ignored");
++        return;
++    }
++
++    vvcc->ptl_present_flag = 1;
++    vvcc->track_ptl = *ptl;
++}
++
++static void vvcc_parse_gci(GetBitContext *gb, VvcPTLRecord *ptl)
++{
++    unsigned int gci_present_flag, gci_num_reserved_bits, gci_bytes;
++    const int start = get_bits_count(gb);
++    const int start_bytes = start >> 3;
++
++    av_assert0((start & 7) == 2);
++
++    gci_present_flag = get_bits1(gb);
++    if (gci_present_flag) {
++        /*
++        * general                             3 bits
++        * picture format                      6 bits
++        * NAL unit type related              10 bits
++        * tile,slice,subpicture partitioning  6 bits
++        * CTU and block partitioning          5 bits
++        * intra                               6 bits
++        * inter                              16 bits
++        * transform,quantization,residual    13 bits
++        * loop filter                         6 bits
++        */
++        skip_bits(gb, 71);
++        gci_num_reserved_bits = get_bits(gb, 8);
++        if (gci_num_reserved_bits)
++            skip_bits(gb, gci_num_reserved_bits);
++    }
++    align_get_bits(gb);
++
++    gci_bytes =  (get_bits_count(gb) >> 3) - start_bytes;
++    if (gci_bytes > MAX_NUM_BYTES_CONSTRAINT_INFO) {
++        av_log(NULL, AV_LOG_WARNING, "GCI bytes exceeds maximum (%d): %d\n",
++            MAX_NUM_BYTES_CONSTRAINT_INFO, gci_bytes);
++    }
++    ptl->num_bytes_constraint_info = FFMIN(gci_bytes, MAX_NUM_BYTES_CONSTRAINT_INFO);
++    memcpy(ptl->general_constraing_info, &gb->buffer[start_bytes], FFMIN(ptl->num_bytes_constraint_info, ptl->num_bytes_constraint_info));
++}
++
++static int vvcc_parse_ptl(GetBitContext *gb,
++                          VvcDecoderConfigurationRecord *vvcc,
++                          int profile_tier_present_flag,
++                          unsigned int max_sub_layers_minus1)
++{
++    VvcPTLRecord ptl = {0};
++
++    if (max_sub_layers_minus1 > VVC_MAX_SUB_LAYERS) {
++        av_log(NULL, AV_LOG_ERROR, "max_sub_layers_minus1 exceeds maximum (%d): %d\n",
++            VVC_MAX_SUB_LAYERS, max_sub_layers_minus1);
++        return AVERROR_INVALIDDATA;
++    }
++
++    if (profile_tier_present_flag) {
++        ptl.general_profile_idc = get_bits(gb, 7);
++        ptl.general_tier_flag = get_bits1(gb);
++    }
++    ptl.general_level_idc = get_bits(gb, 8);
++    ptl.ptl_frame_only_constraint_flag = get_bits1(gb);
++    ptl.ptl_multilayer_enabled_flag = get_bits1(gb);
++    if (profile_tier_present_flag)
++        vvcc_parse_gci(gb, &ptl);
++    for (int i = max_sub_layers_minus1 - 1; i >= 0; --i)
++        ptl.ptl_sublayer_level_present_flag[i] = get_bits1(gb);
++    align_get_bits(gb);
++    for (int i = max_sub_layers_minus1 - 1; i >= 0; --i) {
++        if (ptl.ptl_sublayer_level_present_flag[i])
++            ptl.sublayer_level_idc[i] = get_bits(gb, 8);
++    }
++    if (profile_tier_present_flag) {
++        ptl.num_sub_profiles = get_bits(gb, 8);
++        for (int i = 0; i < ptl.num_sub_profiles; ++i)
++            ptl.general_sub_profile_idc[i] = get_sbits_long(gb, 32);
++    }
++
++    vvcc_update_ptl(vvcc, &ptl);
++
++    return 0;
++}
++
++static int vvcc_parse_opi(GetBitContext *gb,
++                          VvcDecoderConfigurationRecord *vvcc)
++{
++    const int opi_ols_info_present_flag = get_bits1(gb);
++    skip_bits1(gb); // opi_htid_info_present_flag
++    if (opi_ols_info_present_flag)
++        vvcc->output_layer_set_idx = get_ue_golomb_31(gb);
++
++    /* nothing useful for vvcC past this point */
++    return 0;
++}
++
++static int vvcc_parse_dci(GetBitContext *gb,
++                          VvcDecoderConfigurationRecord *vvcc)
++{
++    unsigned int dci_num_ptls_minus1;
++
++    /*
++     * dci_reserved_zero_4bits u(4)
++     */
++    skip_bits(gb, 4);
++
++    dci_num_ptls_minus1 = get_bits(gb, 4);
++
++    for (int i = 0; i <= dci_num_ptls_minus1; ++i) {
++        const int ret = vvcc_parse_ptl(gb, vvcc, 1, 0);
++        if (ret < 0)
++            return ret;
++    }
++
++    /* nothing useful for vvcC past this point */
++    return 0;
++}
++
++static int vvcc_parse_vps(GetBitContext *gb,
++                          VvcDecoderConfigurationRecord *vvcc)
++{
++    unsigned int vps_max_layers_minus1, vps_max_sublayers_minus1;
++    unsigned int vps_default_ptl_dbp_hrd_max_tid_flag = 1;
++    unsigned int vps_all_independent_layers_flag = 1;
++    unsigned int vps_num_ptls_minus1 = 0;
++    unsigned int vps_pt_present_flag[VVC_MAX_SUB_LAYERS] = {0};
++    unsigned int vps_ptl_max_tid[VVC_MAX_SUB_LAYERS] = {0};
++
++    skip_bits(gb, 4); // vps_video_parameter_set_id
++    vps_max_layers_minus1 = get_bits(gb, 6);
++    vps_max_sublayers_minus1 = get_bits(gb, 3);
++    if (vps_max_layers_minus1 && vps_max_sublayers_minus1)
++        vps_default_ptl_dbp_hrd_max_tid_flag = get_bits1(gb);
++    if (vps_max_layers_minus1)
++        vps_all_independent_layers_flag = get_bits1(gb);
++    for (int i = 0; i < vps_max_layers_minus1; ++i) {
++        skip_bits(gb, 6); // vps_layer_id[i]
++        if (i && !vps_all_independent_layers_flag) {
++            const int vps_independent_layer_flag_i = get_bits1(gb);
++            if (!vps_independent_layer_flag_i) {
++                const int vps_max_tid_ref_present_flag_i = get_bits1(gb);
++                for (int j = 0; j < i; ++j) {
++                    const int vps_direct_ref_layer_flag_i_j = get_bits1(gb);
++                    if (vps_max_tid_ref_present_flag_i && vps_direct_ref_layer_flag_i_j)
++                        skip_bits(gb, 3); // vps_max_tid_il_ref_pics_plus1[i][j]
++                }
++            }
++        }
++    }
++    if (vps_max_layers_minus1) {
++        const int vps_each_layer_is_an_ols_flag = vps_all_independent_layers_flag ? get_bits1(gb) : 0;
++        if (!vps_each_layer_is_an_ols_flag) {
++            const int vps_ols_mode_idc = vps_all_independent_layers_flag ? 2 : get_bits(gb, 2);
++            if (vps_ols_mode_idc == 2) {
++                const int vps_num_output_layer_sets_minus2 = get_bits(gb, 8);
++                skip_bits(gb, vps_num_output_layer_sets_minus2 * vps_max_layers_minus1); // vps_ols_output_layer_flag[i][j]
++            }
++            // TODO: derive variable TargetOlsIdx for output_layer_set_idx
++            // see H.266 spec 8.1.1 and 7.4.3.3
++            av_log(NULL, AV_LOG_WARNING, "TargetOlsIdx not derived from VPS, to be implemented\n");
++        }
++        vps_num_ptls_minus1 = get_bits(gb, 8);
++    }
++    for (int i = 0; i < vps_num_ptls_minus1; ++i) {
++        vps_pt_present_flag[i] = i ? get_bits1(gb) : 1;
++        vps_ptl_max_tid[i] = vps_default_ptl_dbp_hrd_max_tid_flag ? vps_max_sublayers_minus1 : get_bits(gb, 3);
++    }
++    align_get_bits(gb);
++    for (int i = 0; i <= vps_num_ptls_minus1; ++i) {
++        const int ret = vvcc_parse_ptl(gb, vvcc, vps_pt_present_flag[i], vps_ptl_max_tid[i]);
++        if (ret < 0)
++            return ret;
++    }
++
++    // TODO: parse vps_ols_dbp_chroma_format[otuput_layer_set_idx]
++    // TODO: parse vps_ols_dbp_bitdepth_minus8[output_layer_set_idx]
++
++    /* nothing useful for vvcC past this point */
++    return 0;
++}
++
++static int vvcc_parse_sps(GetBitContext *gb,
++                          VvcDecoderConfigurationRecord *vvcc)
++{
++    unsigned int
++        sps_video_parameter_set_id,
++        sps_max_sub_layers_minus1,
++        sps_pic_width_max_in_luma_samples,
++        sps_pic_height_max_in_luma_samples,
++        sps_subpic_id_len_minus1;
++    int ctb_size_y;
++    int ret;
++
++    skip_bits(gb, 4); // sps_seq_parameter_set_id
++
++    sps_video_parameter_set_id = get_bits(gb, 4);
++    if (!sps_video_parameter_set_id)
++        vvcc->output_layer_set_idx = 0; // variable TargetOlsIdx in 8.1.1
++
++    sps_max_sub_layers_minus1 = get_bits(gb, 3);
++
++    /*
++     * numTemporalLayers greater than 1 indicates that the stream to which this
++     * configuration record applies is temporally scalable and the contained
++     * number of temporal layers (also referred to as temporal sub-layer or
++     * sub-layer in ISO/IEC 23090-2) is equal to numTemporalLayers. Value 1
++     * indicates that the stream is not temporally scalable. Value 0 indicates
++     * that it is unknown whether the stream is temporally scalable.
++     */
++    vvcc->numTemporalLayers = FFMAX(vvcc->numTemporalLayers,
++                                    sps_max_sub_layers_minus1 + 1);
++
++    vvcc->chroma_format_idc = get_bits(gb, 2);
++
++    ctb_size_y = 1 << (get_bits(gb, 2) + 5); // sps_log2_ctu_size_minus5
++    if (ctb_size_y > 128) {
++        av_log(NULL, AV_LOG_ERROR, "invalid CtbSizeY: %d\n", ctb_size_y);
++        return AVERROR_INVALIDDATA;
++    }
++
++    if (get_bits1(gb)) { // sps_ptl_dbp_hrd_params_present_flag
++        ret = vvcc_parse_ptl(gb, vvcc, 1, sps_max_sub_layers_minus1);
++        if (ret < 0)
++            return ret;
++    }
++
++    skip_bits1(gb); // sps_gdr_enabled_flag
++    if (get_bits1(gb)) // sps_ref_pic_resampling_enabled_flag
++        skip_bits1(gb); // sps_res_change_in_clvs_allowed_flag
++    sps_pic_width_max_in_luma_samples = get_ue_golomb_long(gb);
++    sps_pic_height_max_in_luma_samples = get_ue_golomb_long(gb);
++    vvcc->max_picture_width = sps_pic_width_max_in_luma_samples;
++    vvcc->max_picture_height = sps_pic_height_max_in_luma_samples;
++    if ((ret = av_image_check_size(sps_pic_width_max_in_luma_samples, sps_pic_height_max_in_luma_samples, 0, NULL)) < 0)
++        return ret;
++    if (get_bits1(gb)) { // sps_pic_conformance_flag
++        get_ue_golomb_long(gb); // sps_conf_win_left_offset
++        get_ue_golomb_long(gb); // sps_conf_win_right_offset
++        get_ue_golomb_long(gb); // sps_conf_win_top_offset
++        get_ue_golomb_long(gb); // sps_conf_win_bottom_offset
++    }
++    if (get_bits1(gb)) { // sps_subpic_info_present_flag
++        const unsigned int sps_num_subpics_minus1 = get_ue_golomb(gb);
++        if (sps_num_subpics_minus1) {
++            const unsigned int sps_independent_subpics_flag = get_bits1(gb);
++            const unsigned int sps_subpic_same_size_flag = get_bits1(gb);
++            const int log2_width = av_ceil_log2((sps_independent_subpics_flag + ctb_size_y - 1) / ctb_size_y);
++            const int log2_height = av_ceil_log2((sps_subpic_same_size_flag + ctb_size_y - 1) / ctb_size_y);
++            for (int i = 0; i <= sps_num_subpics_minus1; ++i) {
++                if (!sps_subpic_same_size_flag || i == 0) {
++                    if (i > 0 && sps_pic_width_max_in_luma_samples > ctb_size_y)
++                        skip_bits(gb, log2_width); // sps_subpic_ctu_top_left_x[i]
++                    if (i > 0 && sps_pic_height_max_in_luma_samples > ctb_size_y)
++                        skip_bits(gb, log2_height); // sps_subpic_ctu_top_left_y[i]
++                    if (i < sps_num_subpics_minus1 && sps_pic_width_max_in_luma_samples > ctb_size_y)
++                        skip_bits(gb, log2_width); // sps_subpic_width_minus1[i]
++                    if (i < sps_num_subpics_minus1 && sps_pic_height_max_in_luma_samples > ctb_size_y)
++                        skip_bits(gb, log2_height); // sps_subpic_height_minus1[i]
++                }
++                if (!sps_independent_subpics_flag) {
++                    /*
++                    * sys_subpic_treated_as_pic_flag[i]             u(1)
++                    * sys_loop_filter_across_subpic_enabled_flag[i] u(1)
++                    */
++                    skip_bits(gb, 2);
++                }
++            }
++        }
++        sps_subpic_id_len_minus1 = get_ue_golomb(gb);
++        if (get_bits1(gb)) { // sps_subpic_id_mapping_explicitly_signalled_flag
++            if (get_bits1(gb)) { // sps_subpic_id_mapping_explicitly_signalled_flag
++                skip_bits(gb, (sps_num_subpics_minus1 + 1) * (sps_subpic_id_len_minus1 + 1)); // sps_subpic_id[i]
++            }
++        }
++    }
++
++    vvcc->bit_depth_minus8 = get_ue_golomb_31(gb);
++
++    /* nothing useful for vvcC past this point */
++    return 0;
++}
++
++static void nal_unit_parse_header(GetBitContext *gb, uint8_t *nal_type)
++{
++    /*
++     * forbidden_zero_bit    f(1)
++     * nuh_reserved_zero_bit u(1)
++     * nuh_layer_id          u(6)
++     */
++    skip_bits(gb, 8);
++
++    *nal_type = get_bits(gb, 5);
++
++    /*
++     * nuh_temporal_id_plus1 u(3)
++     */
++    skip_bits(gb, 3);
++}
++
++
++static uint8_t *nal_unit_extract_rbsp(const uint8_t *src, uint32_t src_len,
++                                      uint32_t *dst_len)
++{
++    uint8_t *dst;
++    uint32_t i, len;
++
++    dst = av_malloc(src_len + AV_INPUT_BUFFER_PADDING_SIZE);
++    if (!dst)
++        return NULL;
++
++    /* NAL unit header (2 bytes) */
++    i = len = 0;
++    while (i < 2 && i < src_len)
++        dst[len++] = src[i++];
++
++    while (i + 2 < src_len)
++        if (!src[i] && !src[i + 1] && src[i + 2] == 3) {
++            dst[len++] = src[i++];
++            dst[len++] = src[i++];
++            i++; // remove emulation_prevention_three_byte
++        } else
++            dst[len++] = src[i++];
++
++    while (i < src_len)
++        dst[len++] = src[i++];
++
++    memset(dst + len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
++
++    *dst_len = len;
++    return dst;
++}
++
++static int vvcc_parse_nal_unit(uint8_t *nal_buf, uint32_t nal_size,
++                               VvcDecoderConfigurationRecord *vvcc)
++{
++    int ret = 0;
++    GetBitContext gbc;
++    uint8_t nal_type;
++    uint8_t *rbsp_buf;
++    uint32_t rbsp_size;
++
++    rbsp_buf = nal_unit_extract_rbsp(nal_buf, nal_size, &rbsp_size);
++    if (!rbsp_buf) {
++        ret = AVERROR(ENOMEM);
++        goto end;
++    }
++
++    ret = init_get_bits8(&gbc, rbsp_buf, rbsp_size);
++    if (ret < 0)
++        goto end;
++
++    nal_unit_parse_header(&gbc, &nal_type);
++
++    switch (nal_type) {
++    case VVC_NAL_OPI:
++        ret = vvcc_parse_opi(&gbc, vvcc);
++        break;
++    case VVC_NAL_DCI:
++        ret = vvcc_parse_dci(&gbc, vvcc);
++        break;
++    case VVC_NAL_VPS:
++        ret = vvcc_parse_vps(&gbc, vvcc);
++        break;
++    case VVC_NAL_SPS:
++        ret = vvcc_parse_sps(&gbc, vvcc);
++        break;
++    default:
++        break;
++    }
++
++end:
++    av_free(rbsp_buf);
++    return ret;
++}
++
++static int vvcc_array_add_nal_unit(uint8_t *nal_buf, uint32_t nal_size,
++                                   uint8_t nal_type, int ps_array_completeness,
++                                   VvcDecoderConfigurationRecord *vvcc)
++{
++    int ret;
++    uint8_t index;
++    uint16_t numNalus;
++    VVCCNALUnitArray *array;
++
++    for (index = 0; index < vvcc->numOfArrays; index++)
++        if (vvcc->array[index].NAL_unit_type == nal_type)
++            break;
++
++    if (index >= vvcc->numOfArrays) {
++        uint8_t i;
++
++        ret = av_reallocp_array(&vvcc->array, index + 1, sizeof(VVCCNALUnitArray));
++        if (ret < 0)
++            return ret;
++
++        for (i = vvcc->numOfArrays; i <= index; i++)
++            memset(&vvcc->array[i], 0, sizeof(VVCCNALUnitArray));
++        vvcc->numOfArrays = index + 1;
++    }
++
++    array    = &vvcc->array[index];
++    numNalus = array->numNalus;
++
++    ret = av_reallocp_array(&array->nalUnit, numNalus + 1, sizeof(uint8_t*));
++    if (ret < 0)
++        return ret;
++
++    ret = av_reallocp_array(&array->nalUnitLength, numNalus + 1, sizeof(uint16_t));
++    if (ret < 0)
++        return ret;
++
++    array->nalUnit      [numNalus] = nal_buf;
++    array->nalUnitLength[numNalus] = nal_size;
++    array->NAL_unit_type           = nal_type;
++    array->numNalus++;
++
++    /*
++     * When the sample entry name is ‘vvc1’, the default and mandatory value of
++     * array_completeness is 1 for arrays of all types of parameter sets, and 0
++     * for all other arrays. When the sample entry name is ‘vvi1’, the default
++     * value of array_completeness is 0 for all arrays.
++     */
++    if (nal_type == VVC_NAL_SPS || nal_type == VVC_NAL_PPS)
++        array->array_completeness = ps_array_completeness;
++
++    return 0;
++}
++
++static void vvcc_init(VvcDecoderConfigurationRecord *vvcc)
++{
++    memset(vvcc, 0, sizeof(VvcDecoderConfigurationRecord));
++    vvcc->lengthSizeMinusOne   = 3; // 4 bytes
++}
++
++static void vvcc_close(VvcDecoderConfigurationRecord *vvcc)
++{
++    uint8_t i;
++
++    for (i = 0; i < vvcc->numOfArrays; i++) {
++        vvcc->array[i].numNalus = 0;
++        av_freep(&vvcc->array[i].nalUnit);
++        av_freep(&vvcc->array[i].nalUnitLength);
++    }
++
++    vvcc->numOfArrays = 0;
++    av_freep(&vvcc->array);
++}
++
++static void vvcc_write_ptl(AVIOContext *pb, VvcPTLRecord *ptl, int num_sublayers)
++{
++    uint8_t ptl_sublayer_level_present_flags = 0;
++
++    av_log(NULL, AV_LOG_TRACE,  "num_bytes_constraint_info:           %"PRIu8"\n",
++            ptl->num_bytes_constraint_info);
++    av_log(NULL, AV_LOG_TRACE,  "general_profile_idc:                 %"PRIu8"\n",
++            ptl->general_profile_idc);
++    av_log(NULL, AV_LOG_TRACE,  "general_tier_flag:                   %"PRIu8"\n",
++            ptl->general_tier_flag);
++    av_log(NULL, AV_LOG_TRACE,  "general_level_idc:                   %"PRIu8"\n",
++            ptl->general_level_idc);
++    av_log(NULL, AV_LOG_TRACE,  "ptl_frame_only_constraint_flag:      %"PRIu8"\n",
++            ptl->ptl_frame_only_constraint_flag);
++    av_log(NULL, AV_LOG_TRACE,  "ptl_multilayer_enabled_flag:         %"PRIu8"\n",
++            ptl->ptl_multilayer_enabled_flag);
++    if (ptl->num_bytes_constraint_info) {
++        av_log(NULL, AV_LOG_TRACE,  "general_constraint_info:             ");
++        for (int i = 0; i < ptl->num_bytes_constraint_info; ++i)
++            av_log(NULL, AV_LOG_TRACE, "%02X", ptl->general_constraing_info[i]);
++        av_log(NULL, AV_LOG_TRACE, "\n");
++    }
++    for (int i = num_sublayers - 2; i >= 0; --i)
++        av_log(NULL, AV_LOG_TRACE,  "ptl_sublayer_level_present_flag[%d]: %"PRIu8"\n",
++            i, ptl->ptl_sublayer_level_present_flag[i]);
++    for (int i = num_sublayers; i < 8 && num_sublayers > 1; ++i)
++        av_log(NULL, AV_LOG_TRACE,  "ptl_preserved_zero_bit:              0\n");
++    for (int i = num_sublayers - 2; i >= 0; --i) {
++        if (ptl->ptl_sublayer_level_present_flag[i])
++            av_log(NULL, AV_LOG_TRACE,  "sublayer_level_idc[%d]:              %"PRIu8"\n",
++                i, ptl->sublayer_level_idc[i]);
++    }
++    av_log(NULL, AV_LOG_TRACE,  "num_sub_profiles:                    %"PRIu8"\n",
++            ptl->num_sub_profiles);
++    for (int i = 0; i < ptl->num_sub_profiles; ++i)
++        av_log(NULL, AV_LOG_TRACE,  "general_sub_profile_idc[%d]:         %"PRIu32"\n",
++            i, ptl->general_sub_profile_idc[i]);
++
++    /* unsigned int(8) num_bytes_constraint_info; */
++    avio_w8(pb, ptl->num_bytes_constraint_info);
++
++    /*
++     * unsigned int(7) general_profile_idc;
++     * unsigned int(1) general_tier_flag;
++     */
++    avio_w8(pb, ptl->general_profile_idc << 1 |
++                ptl->general_tier_flag);
++
++    /* unsigned int(8) general_level_idc; */
++    avio_w8(pb, ptl->general_level_idc);
++
++    if (ptl->num_bytes_constraint_info) {
++        /*
++        * unsigned int(1) ptl_frame_only_constraint_flag;
++        * unsigned int(1) ptl_multilayer_enabled_flag;
++        * unsigned int(8*num_bytes_constraint_info - 2) general_constraint_info
++        */
++        ptl->general_constraing_info[0] &= 0x3F;
++        ptl->general_constraing_info[0] |= ptl->ptl_frame_only_constraint_flag << 7 |
++                                           ptl->ptl_multilayer_enabled_flag << 6;
++        avio_write(pb, ptl->general_constraing_info, ptl->num_bytes_constraint_info);
++    } else {
++        // This will align the PTL flags to bytes
++        // ! This is not in ISO/IEC 14496-15:2019(E) draft
++        /*
++        * unsigned int(1) ptl_frame_only_constraint_flag;
++        * unsigned int(1) ptl_multilayer_enabled_flag;
++        */
++        avio_w8(pb, ptl->ptl_frame_only_constraint_flag << 7 |
++                    ptl->ptl_multilayer_enabled_flag << 6);
++    }
++
++    /*
++    * for (i=num_sublayers - 2; i >= 0; i--)
++    *     unsigned int(1) ptl_sublayer_level_present_flag[i]
++    * for (j=num_sublayers; j <= 8 && num_sublayers > 1; j++)
++    *     bit(1) ptl_reserved_zero_bit = 0;
++    */
++    for (int i = num_sublayers - 2; i >= 0; --i)
++        ptl_sublayer_level_present_flags |= ptl->ptl_sublayer_level_present_flag[i] << (i + 9 - num_sublayers);
++    if (num_sublayers > 1) {
++        avio_w8(pb, ptl_sublayer_level_present_flags);
++    }
++
++    for (int i = num_sublayers - 2; i >= 0; --i) {
++        if (ptl->ptl_sublayer_level_present_flag[i]) {
++            /* unsigned int(8) sublayer_level_idc; */
++            avio_w8(pb, ptl->sublayer_level_idc[i]);
++        }
++    }
++
++    /* unsigned int(8) num_sub_profiles; */
++    avio_w8(pb, ptl->num_sub_profiles);
++
++    for (int i = 0; i < ptl->num_sub_profiles; ++i) {
++        /* unsigned int(32) general_sub_profile_idc; */
++        avio_wb32(pb, ptl->general_sub_profile_idc[i]);
++    }
++}
++
++static int vvcc_write(AVIOContext *pb, VvcDecoderConfigurationRecord *vvcc)
++{
++    int sps_count = 0;
++    int pps_count = 0;
++
++
++    /*
++     * It's unclear how to properly compute these fields, so
++     * let's always set them to values meaning 'unspecified'.
++     */
++    vvcc->avgFrameRate      = 0;
++    vvcc->constantFrameRate = 0;
++
++    // TODO: if TargetOlsIdx is set by external means, use it as output_layer_set_idx
++    av_log(NULL, AV_LOG_TRACE,  "lengthSizeMinusOne:                  %"PRIu8"\n",
++            vvcc->lengthSizeMinusOne);
++    av_log(NULL, AV_LOG_TRACE,  "ptl_present_flag:                    %"PRIu8"\n",
++            vvcc->ptl_present_flag);
++    if (vvcc->ptl_present_flag) {
++        av_log(NULL, AV_LOG_TRACE,  "output_layer_set_idx:                %"PRIu16"\n",
++            vvcc->output_layer_set_idx);
++        av_log(NULL, AV_LOG_TRACE,  "numTemporalLayers:                   %"PRIu8"\n",
++            vvcc->numTemporalLayers);
++        av_log(NULL, AV_LOG_TRACE,  "constantFrameRate:                   %"PRIu8"\n",
++            vvcc->constantFrameRate);
++        av_log(NULL, AV_LOG_TRACE,  "chroma_format_idc:                   %"PRIu16"\n",
++            vvcc->chroma_format_idc);
++        av_log(NULL, AV_LOG_TRACE,  "bit_depth_minus8:                    %"PRIu16"\n",
++            vvcc->bit_depth_minus8);
++        av_log(NULL, AV_LOG_TRACE,  "max_picture_width:                        %"PRIu16"\n",
++            vvcc->max_picture_width);
++        av_log(NULL, AV_LOG_TRACE,  "max_picture_height:                        %"PRIu16"\n",
++            vvcc->max_picture_height);
++        av_log(NULL, AV_LOG_TRACE,  "avgFrameRate:                        %"PRIu16"\n",
++            vvcc->avgFrameRate);
++    }
++    av_log(NULL, AV_LOG_TRACE,  "numOfArrays:                         %"PRIu8"\n",
++            vvcc->numOfArrays);
++    for (int i = 0; i < vvcc->numOfArrays; i++) {
++        av_log(NULL, AV_LOG_TRACE, "array_completeness[%"PRIu8"]:               %"PRIu8"\n",
++                i, vvcc->array[i].array_completeness);
++        av_log(NULL, AV_LOG_TRACE, "NAL_unit_type[%"PRIu8"]:                    %"PRIu8"\n",
++                i, vvcc->array[i].NAL_unit_type);
++        av_log(NULL, AV_LOG_TRACE, "numNalus[%"PRIu8"]:                         %"PRIu16"\n",
++                i, vvcc->array[i].numNalus);
++        for (int j = 0; j < vvcc->array[i].numNalus; j++)
++            av_log(NULL, AV_LOG_TRACE,
++                    "nalUnitLength[%"PRIu8"][%"PRIu16"]:                 %"PRIu16"\n",
++                    i, j, vvcc->array[i].nalUnitLength[j]);
++    }
++
++    /*
++     * We need at least one of each: SPS and PPS.
++     */
++    for (int i = 0; i < vvcc->numOfArrays; i++)
++        switch (vvcc->array[i].NAL_unit_type) {
++        case VVC_NAL_SPS:
++            sps_count += vvcc->array[i].numNalus;
++            break;
++        case VVC_NAL_PPS:
++            pps_count += vvcc->array[i].numNalus;
++            break;
++        default:
++            break;
++        }
++    if (!sps_count || sps_count > VVC_MAX_SPS_COUNT ||
++        !pps_count || pps_count > VVC_MAX_PPS_COUNT)
++        return AVERROR_INVALIDDATA;
++
++    /*
++    bit(5) reserved = '11111'b;
++    unsigned int(2) LengthSizeMinusOne;
++    unsigned int(1) ptl_present_flag;
++    */
++    avio_w8(pb, 0xF8 |
++                vvcc->lengthSizeMinusOne << 1 |
++                vvcc->ptl_present_flag);
++
++
++    if (vvcc->ptl_present_flag) {
++        /*
++        unsigned int(9) ols_idx;
++        unsigned int(3) num_sublayers;
++        unsigned int(2) constant_frame_rate;
++        unsigned int(2) chroma_format_idc;
++        */
++        avio_wb16(pb, vvcc->output_layer_set_idx << 7 |
++                      vvcc->numTemporalLayers << 4 |
++                      vvcc->constantFrameRate << 2 |
++                      vvcc->chroma_format_idc);
++        /*
++        unsigned int(3) bit_depth_minus8;
++        bit(5) reserved = '11111'b;
++        */
++        avio_w8(pb, vvcc->bit_depth_minus8 << 5 |
++                    0x1F);
++        /*
++        * VvcPTLRecord(numTemporalLayers) track_ptl
++        */
++        vvcc_write_ptl(pb, &vvcc->track_ptl, vvcc->numTemporalLayers);
++        avio_wb16(pb, vvcc->max_picture_width);
++        avio_wb16(pb, vvcc->max_picture_height);
++        avio_wb16(pb, vvcc->avgFrameRate);
++    }
++
++    /* unsigned int(8) numOfArrays; */
++    avio_w8(pb, vvcc->numOfArrays);
++
++    for (int i = 0; i < vvcc->numOfArrays; i++) {
++        /*
++         * bit(1) array_completeness;
++         * unsigned int(2) reserved = 0;
++         * unsigned int(5) NAL_unit_type;
++         */
++        avio_w8(pb, vvcc->array[i].array_completeness << 7 |
++                    vvcc->array[i].NAL_unit_type & 0x1f);
++
++        /* unsigned int(16) numNalus; */
++        if (vvcc->array[i].NAL_unit_type != VVC_NAL_DCI && vvcc->array[i].NAL_unit_type != VVC_NAL_OPI) {
++            avio_wb16(pb, vvcc->array[i].numNalus);
++        }
++
++        for (int j = 0; j < vvcc->array[i].numNalus; j++) {
++            /* unsigned int(16) nalUnitLength; */
++            avio_wb16(pb, vvcc->array[i].nalUnitLength[j]);
++
++            /* bit(8*nalUnitLength) nalUnit; */
++            avio_write(pb, vvcc->array[i].nalUnit[j],
++                       vvcc->array[i].nalUnitLength[j]);
++        }
++    }
++
++    return 0;
++}
++
++int ff_vvc_annexb2mp4(AVIOContext *pb, const uint8_t *buf_in,
++                      int size, int filter_ps, int *ps_count)
++{
++    int num_ps = 0, ret = 0;
++    uint8_t *buf, *end, *start = NULL;
++
++    if (!filter_ps) {
++        ret = ff_avc_parse_nal_units(pb, buf_in, size);
++        goto end;
++    }
++
++    ret = ff_avc_parse_nal_units_buf(buf_in, &start, &size);
++    if (ret < 0)
++        goto end;
++
++    ret = 0;
++    buf = start;
++    end = start + size;
++
++    while (end - buf > 4) {
++        uint32_t len = FFMIN(AV_RB32(buf), end - buf - 4);
++        uint8_t type = (buf[5] >> 3) & 0x1F;
++
++        buf += 4;
++
++        switch (type) {
++        case VVC_NAL_VPS:
++        case VVC_NAL_SPS:
++        case VVC_NAL_PPS:
++            num_ps++;
++            break;
++        default:
++            ret += 4 + len;
++            avio_wb32(pb, len);
++            avio_write(pb, buf, len);
++            break;
++        }
++
++        buf += len;
++    }
++
++end:
++    av_free(start);
++    if (ps_count)
++        *ps_count = num_ps;
++    return ret;
++}
++
++int ff_vvc_annexb2mp4_buf(const uint8_t *buf_in, uint8_t **buf_out,
++                          int *size, int filter_ps, int *ps_count)
++{
++    AVIOContext *pb;
++    int ret;
++
++    ret = avio_open_dyn_buf(&pb);
++    if (ret < 0)
++        return ret;
++
++    ret   = ff_vvc_annexb2mp4(pb, buf_in, *size, filter_ps, ps_count);
++    if (ret < 0) {
++        ffio_free_dyn_buf(&pb);
++        return ret;
++    }
++
++    *size = avio_close_dyn_buf(pb, buf_out);
++
++    return 0;
++}
++
++int ff_isom_write_vvcc(AVIOContext *pb, const uint8_t *data,
++                       int size, int ps_array_completeness)
++{
++    int ret = 0;
++    uint8_t *buf, *end, *start = NULL;
++    VvcDecoderConfigurationRecord vvcc;
++
++    vvcc_init(&vvcc);
++
++    if (size < 6) {
++        /* We can't write a valid vvcC from the provided data */
++        ret = AVERROR_INVALIDDATA;
++        goto end;
++    } else if (*data == 1 || ((*data >> 3) & 0x1F) == 0x1F) {
++        /* Data is already vvcC-formatted */
++        /* ISO/IEC 14496-15:2019(E) Amendment 2: first byte is configurationVersion(=1)
++           ISO/IEC 14496-15:2021(E) FIDS v4: first byte is reserved('11111'b)+
++           LengthSizeMinusOne(2bits)+ptl_present_flag(1bit) */
++        avio_write(pb, data, size);
++        goto end;
++    } else if (!(AV_RB24(data) == 1 || AV_RB32(data) == 1)) {
++        /* Not a valid Annex B start code prefix */
++        av_log(NULL, AV_LOG_ERROR, "Failed to write vvcc as not a valid Annex B start code prefix.");
++        ret = AVERROR_INVALIDDATA;
++        goto end;
++    }
++
++    ret = ff_avc_parse_nal_units_buf(data, &start, &size);
++    if (ret < 0)
++        goto end;
++
++    buf = start;
++    end = start + size;
++
++    while (end - buf > 4) {
++        uint32_t len = FFMIN(AV_RB32(buf), end - buf - 4);
++        uint8_t type = (buf[5] >> 3) & 0x1F;
++
++        buf += 4;
++
++        switch (type) {
++        case VVC_NAL_DCI:
++        case VVC_NAL_VPS:
++        case VVC_NAL_SPS:
++        case VVC_NAL_PPS:
++        case VVC_NAL_APS_PREFIX:
++        case VVC_NAL_APS_SUFFIX:
++        case VVC_NAL_SEI_PREFIX:
++        case VVC_NAL_SEI_SUFFIX:
++            ret = vvcc_array_add_nal_unit(buf, len, type, ps_array_completeness, &vvcc);
++            if (ret < 0)
++                goto end;
++            break;
++        default:
++            break;
++        }
++
++        ret = vvcc_parse_nal_unit(buf, len, &vvcc);
++        if (ret < 0)
++            goto end;
++
++        buf += len;
++    }
++
++    ret = vvcc_write(pb, &vvcc);
++
++end:
++    vvcc_close(&vvcc);
++    av_free(start);
++    return ret;
++}
+diff --git a/libavformat/vvc.h b/libavformat/vvc.h
+new file mode 100644
+index 0000000000..a2f5f33b51
+--- /dev/null
++++ b/libavformat/vvc.h
+@@ -0,0 +1,99 @@
++/*
++ * Copyright (c) 2021 Tencent
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * internal header for VVC (de)muxer utilities
++ */
++
++#ifndef AVFORMAT_VVC_H
++#define AVFORMAT_VVC_H
++
++#include <stdint.h>
++#include "avio.h"
++
++/**
++ * Writes Annex B formatted VVC NAL units to the provided AVIOContext.
++ *
++ * The NAL units are converted to an MP4-compatible format (start code prefixes
++ * are replaced by 4-byte size fields, as per ISO/IEC 14496-15).
++ *
++ * If filter_ps is non-zero, any VVC parameter sets found in the input will be
++ * discarded, and *ps_count will be set to the number of discarded PS NAL units.
++ *
++ * @param pb address of the AVIOContext where the data shall be written
++ * @param buf_in address of the buffer holding the input data
++ * @param size size (in bytes) of the input buffer
++ * @param filter_ps whether to write parameter set NAL units to the output (0)
++ *        or to discard them (non-zero)
++ * @param ps_count address of the variable where the number of discarded
++ *        parameter set NAL units shall be written, may be NULL
++ * @return the amount (in bytes) of data written in case of success, a negative
++ *         value corresponding to an AVERROR code in case of failure
++ */
++int ff_vvc_annexb2mp4(AVIOContext *pb, const uint8_t *buf_in,
++                      int size, int filter_ps, int *ps_count);
++
++/**
++ * Writes Annex B formatted VVC NAL units to a data buffer.
++ *
++ * The NAL units are converted to an MP4-compatible format (start code prefixes
++ * are replaced by 4-byte size fields, as per ISO/IEC 14496-15).
++ *
++ * If filter_ps is non-zero, any VVC parameter sets found in the input will be
++ * discarded, and *ps_count will be set to the number of discarded PS NAL units.
++ *
++ * On success, *size holds the size (in bytes) of the output data buffer.
++ *
++ * @param buf_in address of the buffer holding the input data
++ * @param size address of the variable holding the size (in bytes) of the input
++ *        buffer (on input) and of the output buffer (on success)
++ * @param buf_out on success, address of the variable holding the address of
++ *        the output buffer
++ * @param filter_ps whether to write parameter set NAL units to the output (0)
++ *        or to discard them (non-zero)
++ * @param ps_count address of the variable where the number of discarded
++ *        parameter set NAL units shall be written, may be NULL
++ * @return 0 in case of success, a negative value corresponding to an AVERROR
++ *         code in case of failure
++ * @note *buf_out will be treated as uninitialized on input and won't be freed.
++ */
++int ff_vvc_annexb2mp4_buf(const uint8_t *buf_in, uint8_t **buf_out,
++                          int *size, int filter_ps, int *ps_count);
++
++/**
++ * Writes VVC extradata (parameter sets, declarative SEI NAL units) to the
++ * provided AVIOContext.
++ *
++ * If the extradata is Annex B format, it gets converted to vvcC format before
++ * writing.
++ *
++ * @param pb address of the AVIOContext where the vvcC shall be written
++ * @param data address of the buffer holding the data needed to write the vvcC
++ * @param size size (in bytes) of the data buffer
++ * @param ps_array_completeness whether all parameter sets are in the vvcC (1)
++ *        or there may be additional parameter sets in the bitstream (0)
++ * @return >=0 in case of success, a negative value corresponding to an AVERROR
++ *         code in case of failure
++ */
++int ff_isom_write_vvcc(AVIOContext *pb, const uint8_t *data,
++                       int size, int ps_array_completeness);
++
++#endif /* AVFORMAT_VVC_H */
+-- 
+2.25.1
+
